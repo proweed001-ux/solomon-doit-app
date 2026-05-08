@@ -1,0 +1,6 @@
+{
+  "name": "Mobile Web App",
+  "description": "A mobile-first web application ready to be built from the user's uploaded ZIP file.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
