@@ -6,10 +6,12 @@
    - SOTypeID filtering support
    - Cancelled row exclusion
    - Proper dedup with Invoice_No + LineRef
+   - Subtotal/Grand-Total row exclusion
+   - Header-total inflation detection & prevention
    ============================================================ */
 
 import JSZip from 'jszip';
-import { toStr, norm, pickFirst, isCancelled } from './fieldNormalizer';
+import { toStr, norm, pickFirst, isCancelled, isHeaderTotalColumn } from './fieldNormalizer';
 import { normalizeDateKey } from './dateNormalizer';
 import { buildFieldMap, getUnmappedColumns, safeNonNegInt, safeNum, FIELD_ALIASES, pickFieldIndex } from './fieldNormalizer';
 import type { NormalizedRow } from '@/types';
@@ -23,6 +25,51 @@ export interface ParseResult {
   duplicatesRemoved: number;
   rawCount: number;
   cancelledCount: number;
+}
+
+/** Detect if a row is a subtotal/grand-total row that should be excluded.
+ *  These rows appear in Excel PivotTable exports and aggregate data,
+ *  causing massive inflation if included.
+ */
+function isGrandTotalRow(row: Record<string, unknown>): boolean {
+  const allValues = Object.values(row).map(v => toStr(v).toLowerCase().trim());
+  const joined = allValues.join('|');
+
+  // Detect common total row patterns
+  const totalPatterns = [
+    'grand total', 'grandtotal', 'grand_total',
+    'total', 'totals', 'total result',
+    'subtotal', 'sub total', 'sub_total',
+    'ผลรวม', 'รวมทั้งสิ้น', 'ยอดรวม',
+    '(blank)', 'blank', '(empty)', 'empty',
+    'all', 'overall total',
+  ];
+
+  // Check if ANY cell in the row contains a total pattern
+  for (const val of allValues) {
+    if (!val) continue;
+    for (const pattern of totalPatterns) {
+      if (val === pattern) return true;
+      // Special case: "Grand Total" often appears as a row label
+      if (val.includes('grand') && val.includes('total')) return true;
+      if (val.includes('ผลรวม') && val.length < 20) return true;
+    }
+  }
+
+  // Check if the row looks like an aggregation (has very few non-empty cells
+  // and one of them is a suspiciously round large number)
+  const nonEmptyCount = allValues.filter(v => v !== '').length;
+  if (nonEmptyCount <= 2) {
+    // Could be a sparse total row - check if any value looks like a total label
+    for (const val of allValues) {
+      if (totalPatterns.some(p => val.includes(p))) return true;
+    }
+  }
+
+  // Check joined string for multi-word total patterns
+  if (joined.includes('grand') && joined.includes('total')) return true;
+
+  return false;
 }
 
 /** Parse Excel file and extract rows */
@@ -61,10 +108,24 @@ export async function parseExcelFile(file: File): Promise<ParseResult> {
     throw new Error('ไม่พบข้อมูลที่ใช้งานได้ในไฟล์');
   }
 
+  // --- CRITICAL: Filter out subtotal/grand-total rows BEFORE field mapping ---
+  const beforeFilterCount = rawRows.length;
+  rawRows = rawRows.filter(r => !isGrandTotalRow(r));
+  const grandTotalRowsRemoved = beforeFilterCount - rawRows.length;
+  if (grandTotalRowsRemoved > 0) {
+    warnings.push(`⚠ ตัดแถว Grand Total / Subtotal ออก: ${grandTotalRowsRemoved} แถว (ป้องกันการคำนวณซ้ำ)`);
+  }
+
   // Normalize column names and build field map
   const allKeys = new Set<string>();
   rawRows.forEach(r => Object.keys(r).forEach(k => allKeys.add(k)));
   const columnNames = [...allKeys];
+
+  // --- CRITICAL: Warn if any column looks like a header total ---
+  const headerTotalColumns = columnNames.filter(isHeaderTotalColumn);
+  if (headerTotalColumns.length > 0) {
+    warnings.push(`🚫 พบคอลัมน์ Header Total (จะไม่ใช้): ${headerTotalColumns.join(', ')}`);
+  }
 
   const fieldMap = buildFieldMap(columnNames);
   const unmappedColumns = getUnmappedColumns(columnNames, fieldMap);
@@ -347,6 +408,75 @@ async function parseWorksheetFallback(buf: ArrayBuffer, _warnings: string[]): Pr
   return rows.length ? rows : null;
 }
 
+/** Detect if invoiceAmt appears to be a header total repeated across lines.
+ *  Returns true if all lines for the same invoice have the exact same amount
+ *  but different SKUs (clear sign of header-total inflation).
+ */
+function detectHeaderTotalInflation(
+  rows: Record<string, unknown>[],
+  fieldMap: Map<string, number>,
+  columnNames: string[]
+): Map<number, boolean> {
+  const inflationFlags = new Map<number, boolean>();
+
+  // Group rows by invoiceNo
+  const invoiceGroups = new Map<string, { idx: number; amt: number; sku: string }[]>();
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const invNo = toStr(
+      r.invoiceNo || r.Invoice_No || r['Invoice_No'] || r.InvoiceNo || r.invcnbr
+    );
+    if (!invNo) continue;
+
+    // Get the mapped amount value
+    const idx = fieldMap.get('invoiceAmt');
+    let amtVal = '';
+    if (idx !== undefined && columnNames[idx]) {
+      const v = r[columnNames[idx]];
+      if (v != null) amtVal = String(v).trim();
+    }
+    // Fallback to direct property
+    if (!amtVal) {
+      amtVal = pickFirst(
+        r.amt, r.Amt, r.invoiceamtwithout_tax, r['InvcAmtWithout_Tax'],
+        r.InvoiceAmt, r.invoiceAmt, r['InvoiceAmt'], r.InvcAmt
+      );
+    }
+    const amt = safeNum(amtVal);
+
+    // Get SKU for diversity check
+    const sku = toStr(
+      r.sku || r.SKU_Desc || r.skuDesc || r.itemName || r.productName || r.skuCode || r.SKU_Code
+    );
+
+    if (!invoiceGroups.has(invNo)) {
+      invoiceGroups.set(invNo, []);
+    }
+    invoiceGroups.get(invNo)!.push({ idx: i, amt, sku });
+  }
+
+  // For each invoice group, check if all amounts are identical but SKUs differ
+  for (const [invNo, items] of invoiceGroups.entries()) {
+    if (items.length < 2) continue;
+
+    const firstAmt = items[0].amt;
+    const allSameAmt = items.every(item => item.amt === firstAmt && firstAmt > 0);
+    const distinctSkus = new Set(items.map(item => item.sku).filter(Boolean));
+    const hasDifferentSkus = distinctSkus.size > 1;
+
+    if (allSameAmt && hasDifferentSkus) {
+      // This is a clear sign of header-total inflation
+      // Flag ALL rows for this invoice except the first one
+      for (let j = 1; j < items.length; j++) {
+        inflationFlags.set(items[j].idx, true);
+      }
+    }
+  }
+
+  return inflationFlags;
+}
+
 /** Normalize raw rows to NormalizedRow format - SOLOMON COMPLIANT */
 function normalizeRows(
   rows: Record<string, unknown>[],
@@ -372,6 +502,10 @@ function normalizeRows(
   // Track if we found key fields
   let hasQtyShipPcs = false;
   let hasInvoiceAmt = false;
+
+  // Detect header-total inflation BEFORE processing rows
+  const inflationFlags = detectHeaderTotalInflation(rows, fieldMap, columnNames);
+  let inflationDetectedCount = 0;
 
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -435,18 +569,26 @@ function normalizeRows(
     const orderVal = r.qtyOrder ?? r.QtyOrder ?? r['QtyOrder'];
     const qtyOrd = orderVal != null ? safeNonNegInt(orderVal) : 0;
 
-    // --- Amounts: strictly use InvoiceAmt / amt / invoiceamtwithout_tax as requested ---
-    // Prioritize line-level amount candidates (amt, invoiceamtwithout_tax) over InvoiceAmt
-    // to prevent assigning the whole bill's amount to every SKU.
+    // --- Amounts: strictly use line-level amt / invoiceamtwithout_tax / invoiceamt ---
+    // If this row was flagged as header-total inflation, ZERO the amount to prevent duplication.
     let invAmt = 0;
-    const directAmt = pickFirst(
-      r.amt, r.Amt, r.invoiceamtwithout_tax, r['InvcAmtWithout_Tax'],
-      r.InvoiceAmt, r.invoiceAmt, r['InvoiceAmt'], r.InvcAmt,
-      getVal(r, 'invoiceAmt')
-    );
-    if (directAmt != null && String(directAmt).trim()) {
-      invAmt = safeNum(directAmt);
-      hasInvoiceAmt = true;
+    const isInflated = inflationFlags.get(i) === true;
+
+    if (isInflated) {
+      // Header total detected: this row's amount is a duplicate of the invoice header
+      // Zero it out - the first row for this invoice already carries the amount
+      invAmt = 0;
+      inflationDetectedCount++;
+    } else {
+      const directAmt = pickFirst(
+        r.amt, r.Amt, r.invoiceamtwithout_tax, r['InvcAmtWithout_Tax'],
+        r.InvoiceAmt, r.invoiceAmt, r['InvoiceAmt'], r.InvcAmt,
+        getVal(r, 'invoiceAmt')
+      );
+      if (directAmt != null && String(directAmt).trim()) {
+        invAmt = safeNum(directAmt);
+        hasInvoiceAmt = true;
+      }
     }
 
     const invAmtWithTax = 0; // "ห้ามใช้ amtVat / invoiceamtwith_tax" - we won't record it if not needed, or just 0.
@@ -520,6 +662,9 @@ function normalizeRows(
 
   if (dropped.length > 0) {
     warnings.push(`แถวที่ถูกตัดออก: ${dropped.length} แถว (ไม่มีข้อมูลสินค้า/ร้านค้า/แบรนด์)`);
+  }
+  if (inflationDetectedCount > 0) {
+    warnings.push(`🛡️ ป้องกัน Header-Total Inflation: ตั้งยอดเป็น 0 สำหรับ ${inflationDetectedCount} แถว (ยอดซ้ำจาก Invoice Header)`);
   }
   if (hasQtyShipPcs) {
     warnings.push('✓ พบฟิลด์ QtyShipPCS - ใช้เป็นจำนวนชิ้นหลัก');

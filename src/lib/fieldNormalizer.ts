@@ -1,7 +1,7 @@
 /* ============================================================
    Field Normalizer - Solomon Compliant
    - Strict QtyShipPCS priority
-   - InvoiceAmt as primary amount
+   - InvoiceAmt as primary amount (header-total protected)
    - SOTypeID, SO_Date, Invoice_Date separation
    ============================================================ */
 
@@ -72,9 +72,36 @@ export function sameStore(a: string, b: string): boolean {
   return na === nb || na.includes(nb) || nb.includes(na);
 }
 
+/** Patterns that indicate a column is a HEADER TOTAL (not line-level amount).
+ *  These must NEVER be mapped to invoiceAmt.
+ */
+const HEADER_TOTAL_PATTERNS = [
+  'totinvc', 'totinvcamt', 'totalinvoice', 'totalinvoiceamount',
+  'grandtotal', 'grand_total', 'totalamount', 'total_amount',
+  'ยอดรวม', 'ยอดรวมทั้งสิ้น', 'ยอดรวมgrandtotal',
+  'sumofinvoiceamt', 'sumofinvcamt', 'sumofamount',
+  'ผลรวมของinvoiceamt', 'ผลรวมของinvcamt',
+];
+
+/** Check if a column name represents a header total (not line-level).
+ *  Returns true for TotInvc, GrandTotal, TotalAmount, etc.
+ */
+export function isHeaderTotalColumn(columnName: string): boolean {
+  const f = norm(columnName);
+  if (!f) return false;
+  // Direct match against known header-total patterns
+  if (HEADER_TOTAL_PATTERNS.some(p => f === norm(p))) return true;
+  // Check for telltale compound patterns
+  if (f.includes('grandtotal') || f.includes('grandtotalamount')) return true;
+  if (f.startsWith('totinvc') || f.startsWith('totalinvc')) return true;
+  if (f === 'total' || f === 'totalamount' || f === 'totalsum') return true;
+  return false;
+}
+
 /* ---- Field Aliases - SOLOMON COMPLIANT ----
    Priority order matters! First match wins.
    QtyShipPCS must match BEFORE QtyShip
+   INVOICEAMT aliases must NEVER include header totals
 */
 export const FIELD_ALIASES: Record<string, string[]> = {
   // Salesperson
@@ -110,7 +137,8 @@ export const FIELD_ALIASES: Record<string, string[]> = {
   qtyOrder: ['qtyorder', 'orderqty', 'quantityordered', 'จำนวนสั่ง'],
 
   // Amounts - strictly use amt / invoiceamtwithout_tax / invoiceamt as primary
-  invoiceAmt: ['amt', 'amount', 'invoiceamtwithout_tax', 'invoiceamt', 'invcamt', 'ยอด', 'ยอดเงิน', 'ยอดขาย', 'ราคารวม', 'ยอดรวม', 'ยอดสุทธิ', 'จำนวนเงิน', 'จำนวนเงินรวม', 'ยอดเงินรวม', 'ราคา', 'มูลค่า', 'netamount', 'net_amount', 'totalamount', 'total_amount', 'grandtotal', 'grand_total'],
+  // NEVER map header totals (TotInvc, GrandTotal, etc.) to invoiceAmt
+  invoiceAmt: ['amt', 'amount', 'invoiceamtwithout_tax', 'invoiceamt', 'invcamt', 'ยอด', 'ยอดเงิน', 'ยอดขาย', 'ราคารวม', 'ยอดสุทธิ', 'จำนวนเงิน', 'ราคา', 'มูลค่า', 'netamount', 'net_amount'],
   invoiceAmtWithTax: [], // ห้ามใช้ amtVat / invoiceamtwith_tax
 
   // Telesale
@@ -123,7 +151,12 @@ function aliasScore(field: string, alias: string): number {
   const f = norm(field);
   const a = norm(alias);
   if (!f || !a) return 0;
-  
+
+  // BLOCK header-total columns from being matched to invoiceAmt or any amount field
+  if (a === 'invoiceamt' || a === 'amt' || a === 'amount' || a === 'invcamt' || a === 'invoiceamtwithout_tax') {
+    if (isHeaderTotalColumn(field)) return 0;
+  }
+
   // Prevent matching vat/tax columns to non-vat/tax aliases
   if (!a.includes('vat') && !a.includes('tax') && !a.includes('ภาษี')) {
     if (f.includes('vat') || f.includes('tax') || f.includes('ภาษี')) return 0;
@@ -132,7 +165,7 @@ function aliasScore(field: string, alias: string): number {
   if (!a.includes('withtax') && f.includes('withtax')) return 0;
 
   if (f === a) return 100;
-  
+
   // If alias is very short like "amt" or "ยอด", only allow exact match or word boundary
   if (a === 'amt' || a === 'ยอด') {
     if (f.startsWith(a) || f.endsWith(a)) return 60;

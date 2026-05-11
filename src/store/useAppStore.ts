@@ -3,7 +3,7 @@
    - Dashboard filters with SOTypeID, DateField selection
    - Global stats (not tied to psData only)
    - QtyShipPCS as primary quantity
-   - InvoiceAmt as primary amount
+   - InvoiceAmt as primary amount (with header-total dedup)
    ============================================================ */
 
 import { create } from 'zustand';
@@ -143,6 +143,55 @@ const DEFAULT_DASHBOARD_FILTERS: DashboardFilters = {
   brand: '',
   includeCancelled: false,
 };
+
+/** Deduplicate invoice amounts to prevent header-total inflation.
+ *  
+ *  Problem: If an invoice has 5 line items, but the Excel export repeats
+ *  the same InvoiceAmt (header total) on every line, summing all 5 lines
+ *  gives 5x the actual amount.
+ *  
+ *  Solution: For each invoice, if multiple rows share the exact same
+ *  invoiceAmt but have different SKUs, only count the amount ONCE.
+ *  This preserves legitimate line-level amounts where each line has
+ *  a different value.
+ *  
+ *  Returns the deduplicated amount for a single row.
+ */
+function getDeduplicatedInvoiceAmt(
+  row: NormalizedRow,
+  allRows: NormalizedRow[]
+): number {
+  const amt = safeNum(row.invoiceAmt);
+  if (amt === 0) return 0;
+  if (!row.invoiceNo) return amt; // No invoice number, can't dedup
+
+  // Find all rows for the same invoice
+  const sameInvoiceRows = allRows.filter(
+    r => r.invoiceNo === row.invoiceNo && !r.cancelled
+  );
+  if (sameInvoiceRows.length < 2) return amt; // Only one line, no inflation possible
+
+  // Check if ALL lines for this invoice have the exact same amount
+  const distinctAmts = new Set(sameInvoiceRows.map(r => safeNum(r.invoiceAmt)));
+  const distinctSkus = new Set(sameInvoiceRows.map(r => r.skuCode || r.sku).filter(Boolean));
+
+  // Inflation detection: same amount across multiple different SKUs
+  const isHeaderTotalInflation = distinctAmts.size === 1 && distinctSkus.size > 1;
+
+  if (isHeaderTotalInflation) {
+    // Only the first row for this invoice gets the amount; others get 0
+    // Use SKU as tiebreaker for deterministic ordering
+    const firstRow = sameInvoiceRows.sort((a, b) =>
+      (a.skuCode || a.sku).localeCompare(b.skuCode || b.sku)
+    )[0];
+    if (row.id === firstRow.id) {
+      return amt; // First row keeps the amount
+    }
+    return 0; // Other rows get zero (amount already counted once)
+  }
+
+  return amt; // Normal line-level amounts, sum all
+}
 
 export const useAppStore = create<AppStore>()(immer((set, get) => ({
   // Navigation
@@ -410,6 +459,13 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
     const CHUNK = 500;
     const rows = state.psData;
 
+    // Precompute deduplicated amounts for all rows to prevent
+    // header-total inflation in TOD aggregation
+    const dedupedAmts = new Map<string, number>();
+    for (const r of rows) {
+      dedupedAmts.set(r.id, getDeduplicatedInvoiceAmt(r, rows));
+    }
+
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const key = `${toStr(r.brand || 'อื่นๆ')}||${toStr(r.size || 'อื่นๆ')}||${toStr(r.sku || '—')}`;
@@ -437,8 +493,8 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
       tod[key].totalPcs += safeNonNegInt(r.qtyShipPcs);
       // Cases separate
       tod[key].totalCse += safeNonNegInt(r.qtyShipCse);
-      // InvoiceAmt (summary/reference only)
-      tod[key].totalInvoiceAmt += safeNum(r.invoiceAmt);
+      // InvoiceAmt with HEADER-TOTAL DEDUP - use precomputed deduplicated amount
+      tod[key].totalInvoiceAmt += dedupedAmts.get(r.id) ?? safeNum(r.invoiceAmt);
       // Detail row amount: use row-level amt only, never InvoiceAmt fallback
       const rawFields = (r as any)?._provenance?.rawFields as Record<string, unknown> | undefined;
       const detailAmtRaw = rawFields ? (rawFields.amt ?? rawFields.Amt) : undefined;
@@ -521,11 +577,18 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
     const invoices = new Set<string>();
     const soTypeBreakdown: Record<string, { count: number; pcs: number; amt: number }> = {};
 
+    // Precompute deduplicated amounts to prevent header-total inflation
+    const dedupedAmts = new Map<string, number>();
+    for (const r of raw) {
+      dedupedAmts.set(r.id, getDeduplicatedInvoiceAmt(r, raw));
+    }
+
     for (const r of raw) {
       if (r.cancelled) continue;
       totalPcs += safeNonNegInt(r.qtyShipPcs);
       totalCse += safeNonNegInt(r.qtyShipCse);
-      totalInvoiceAmt += safeNum(r.invoiceAmt);
+      // Use deduplicated amount to prevent header-total inflation
+      totalInvoiceAmt += dedupedAmts.get(r.id) ?? safeNum(r.invoiceAmt);
       if (r.store) stores.add(r.store);
       if (r.sku) skus.add(r.sku);
       if (r.invoiceNo) invoices.add(r.invoiceNo);
@@ -536,7 +599,8 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
       }
       soTypeBreakdown[stid].count += 1;
       soTypeBreakdown[stid].pcs += safeNonNegInt(r.qtyShipPcs);
-      soTypeBreakdown[stid].amt += safeNum(r.invoiceAmt);
+      // Use deduplicated amount in breakdown too
+      soTypeBreakdown[stid].amt += dedupedAmts.get(r.id) ?? safeNum(r.invoiceAmt);
     }
 
     set((state) => {
