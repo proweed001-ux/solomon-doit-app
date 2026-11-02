@@ -18,7 +18,7 @@ import {
 } from '@/lib/indexedDB';
 import { parseExcelFile } from '@/lib/excelParser';
 import { normalizeDateKey } from '@/lib/dateNormalizer';
-import { toStr, samePerson, sameStore, norm, safeNonNegInt, safeNum } from '@/lib/fieldNormalizer';
+import { toStr, samePerson, sameStore, norm, safeNonNegInt, safeNum, psKeyOf } from '@/lib/fieldNormalizer';
 import { immer } from 'zustand/middleware/immer';
 
 interface AppStore {
@@ -155,42 +155,40 @@ const DEFAULT_DASHBOARD_FILTERS: DashboardFilters = {
  *  This preserves legitimate line-level amounts where each line has
  *  a different value.
  *  
- *  Returns the deduplicated amount for a single row.
+ *  Returns the deduplicated amount for every row, keyed by row id.
+ *  Rows are grouped by invoice in one pass (the old per-row scan was
+ *  O(n^2) and froze the app on large files).
  */
-function getDeduplicatedInvoiceAmt(
-  row: NormalizedRow,
-  allRows: NormalizedRow[]
-): number {
-  const amt = safeNum(row.invoiceAmt);
-  if (amt === 0) return 0;
-  if (!row.invoiceNo) return amt; // No invoice number, can't dedup
-
-  // Find all rows for the same invoice
-  const sameInvoiceRows = allRows.filter(
-    r => r.invoiceNo === row.invoiceNo && !r.cancelled
-  );
-  if (sameInvoiceRows.length < 2) return amt; // Only one line, no inflation possible
-
-  // Check if ALL lines for this invoice have the exact same amount
-  const distinctAmts = new Set(sameInvoiceRows.map(r => safeNum(r.invoiceAmt)));
-  const distinctSkus = new Set(sameInvoiceRows.map(r => r.skuCode || r.sku).filter(Boolean));
-
-  // Inflation detection: same amount across multiple different SKUs
-  const isHeaderTotalInflation = distinctAmts.size === 1 && distinctSkus.size > 1;
-
-  if (isHeaderTotalInflation) {
-    // Only the first row for this invoice gets the amount; others get 0
-    // Use SKU as tiebreaker for deterministic ordering
-    const firstRow = sameInvoiceRows.sort((a, b) =>
-      (a.skuCode || a.sku).localeCompare(b.skuCode || b.sku)
-    )[0];
-    if (row.id === firstRow.id) {
-      return amt; // First row keeps the amount
-    }
-    return 0; // Other rows get zero (amount already counted once)
+function computeDeduplicatedInvoiceAmts(allRows: NormalizedRow[]): Map<string, number> {
+  const byInvoice = new Map<string, NormalizedRow[]>();
+  for (const r of allRows) {
+    if (!r.invoiceNo || r.cancelled) continue;
+    const list = byInvoice.get(r.invoiceNo);
+    if (list) list.push(r); else byInvoice.set(r.invoiceNo, [r]);
   }
 
-  return amt; // Normal line-level amounts, sum all
+  // Invoices whose lines all repeat one amount across different SKUs:
+  // only the first line (by SKU) keeps the amount.
+  const firstRowIdByInvoice = new Map<string, string>();
+  for (const [invoiceNo, sameInvoiceRows] of byInvoice) {
+    if (sameInvoiceRows.length < 2) continue;
+    const distinctAmts = new Set(sameInvoiceRows.map(r => safeNum(r.invoiceAmt)));
+    const distinctSkus = new Set(sameInvoiceRows.map(r => r.skuCode || r.sku).filter(Boolean));
+    if (distinctAmts.size === 1 && distinctSkus.size > 1) {
+      const firstRow = [...sameInvoiceRows].sort((a, b) =>
+        (a.skuCode || a.sku).localeCompare(b.skuCode || b.sku)
+      )[0];
+      firstRowIdByInvoice.set(invoiceNo, firstRow.id);
+    }
+  }
+
+  const out = new Map<string, number>();
+  for (const r of allRows) {
+    const amt = safeNum(r.invoiceAmt);
+    const firstId = r.invoiceNo ? firstRowIdByInvoice.get(r.invoiceNo) : undefined;
+    out.set(r.id, amt !== 0 && firstId !== undefined && r.id !== firstId ? 0 : amt);
+  }
+  return out;
 }
 
 export const useAppStore = create<AppStore>()(immer((set, get) => ({
@@ -387,7 +385,7 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
   buildPSList: async (rows: NormalizedRow[]) => {
     const map = new Map<string, PSInfo>();
     for (const r of rows) {
-      const rawName = toStr(r.psName || r.psCode || 'ไม่ระบุ');
+      const rawName = psKeyOf(r);
       const key = rawName;
       if (!map.has(key)) {
         map.set(key, { name: rawName, code: toStr(r.psCode || ''), orders: 0, stores: new Set() });
@@ -422,7 +420,7 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
     // Filter by date using the configured date field
     const dateField = state.settings.dashboardDateField;
     const filtered = allRows.filter(r =>
-      samePerson(r.psName || r.psCode || '', ps) &&
+      psKeyOf(r) === ps &&
       normalizeDateKey(r[dateField as keyof NormalizedRow] as string || r.date) === dt
     );
 
@@ -461,10 +459,7 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
 
     // Precompute deduplicated amounts for all rows to prevent
     // header-total inflation in TOD aggregation
-    const dedupedAmts = new Map<string, number>();
-    for (const r of rows) {
-      dedupedAmts.set(r.id, getDeduplicatedInvoiceAmt(r, rows));
-    }
+    const dedupedAmts = computeDeduplicatedInvoiceAmts(rows);
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
@@ -578,10 +573,7 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
     const soTypeBreakdown: Record<string, { count: number; pcs: number; amt: number }> = {};
 
     // Precompute deduplicated amounts to prevent header-total inflation
-    const dedupedAmts = new Map<string, number>();
-    for (const r of raw) {
-      dedupedAmts.set(r.id, getDeduplicatedInvoiceAmt(r, raw));
-    }
+    const dedupedAmts = computeDeduplicatedInvoiceAmts(raw);
 
     for (const r of raw) {
       if (r.cancelled) continue;
@@ -802,7 +794,9 @@ export const useAppStore = create<AppStore>()(immer((set, get) => ({
   },
 
   calcRem: (item) => {
-    const storeSum = Object.values(item.stores || {}).reduce((s, v) => s + safeNonNegInt(v), 0);
+    // Only count store columns that are currently in the table. Quantities left
+    // under a store the column was switched away from are not on any bill.
+    const storeSum = get().storeCols.reduce((s, st) => s + safeNonNegInt(item.stores?.[st]), 0);
     return safeNonNegInt(item.totalPcs) - storeSum + safeNonNegInt(item.add) - safeNonNegInt(item.remove);
   },
 

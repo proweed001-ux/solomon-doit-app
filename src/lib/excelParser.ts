@@ -549,8 +549,11 @@ function normalizeRows(
 
     // --- Quantities: STRICT QtyShipPCS priority ---
     let qtyPcs = 0;
-    const directPcs = r.qtyShipPcs ?? r.QtyShipPCS ?? r['QtyShipPCS'] ?? r.ShipQtyPCS ?? r.shipQtyPCS;
-    if (directPcs != null && String(directPcs).trim()) {
+    const directPcs = pickFirst(
+      r.qtyShipPcs, r.QtyShipPCS, r['QtyShipPCS'], r.ShipQtyPCS, r.shipQtyPCS,
+      getVal(r, 'qtyShipPcs')
+    );
+    if (directPcs) {
       qtyPcs = safeNonNegInt(directPcs);
       hasQtyShipPcs = true;
     } else {

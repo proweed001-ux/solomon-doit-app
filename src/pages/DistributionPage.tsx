@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useAppStore } from '@/store/useAppStore';
-import { safeNonNegInt } from '@/lib/fieldNormalizer';
+import { safeNonNegInt, psKeyOf } from '@/lib/fieldNormalizer';
 import { displayDateKey, normalizeDateKey } from '@/lib/dateNormalizer';
 import { ArrowLeft, Search } from 'lucide-react';
 
@@ -11,7 +11,7 @@ export default function DistributionPage() {
   const results = useMemo(() => {
     const s = query.trim().toLowerCase();
     const baseRows = selectedPS
-      ? raw.filter(r => (r.psName || r.psCode || '') === selectedPS || r.psName?.includes(selectedPS))
+      ? raw.filter(r => psKeyOf(r) === selectedPS)
       : raw.slice();
 
     const rows = s

@@ -13,7 +13,10 @@ export function excelSerialToKey(serial: number): string {
   const ms = Math.round((serial - days) * 86400 * 1000);
   const utc = Date.UTC(1899, 11, 30 + days) + ms;
   const d = new Date(utc);
-  return keyFromDate(d);
+  // Excel serials are wall-clock values with no timezone. The Date above holds
+  // them as UTC, so read the UTC fields; local getters shift the day in any
+  // non-UTC timezone (e.g. 18:00 becomes the next day in UTC+7).
+  return keyFromDate(new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
 /** Convert Date object to YYYY-MM-DD key */

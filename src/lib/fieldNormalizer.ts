@@ -56,6 +56,12 @@ export function isCancelled(v: unknown): boolean {
   return s === '1' || s === 'true' || s === 'yes' || s === 'cancelled' || s === 'ยกเลิก';
 }
 
+/** Salesperson key for a row. buildPSList groups by this exact key, so
+ *  anything that filters by the selected PS must use it too. */
+export function psKeyOf(r: { psName?: string; psCode?: string }): string {
+  return toStr(r.psName || r.psCode || 'ไม่ระบุ');
+}
+
 /** Check if two person names are the same (fuzzy) */
 export function samePerson(a: string, b: string): boolean {
   const na = norm(a);
