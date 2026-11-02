@@ -88,18 +88,19 @@ export default function TODPage() {
   const viewStoreCols = activeStoreMode === 'ALL' ? storeCols : [activeStoreMode];
 
   const grandTotals = useMemo(() => {
-    let pcs = 0, amt: number | null = null, add = 0, rem = 0;
+    let pcs = 0, amt: number | null = null, add = 0, rem = 0, allStoresTotal = 0;
     const storeSums: number[] = viewStoreCols.map(() => 0);
     Object.values(todData).forEach(d => {
       pcs += d.totalPcs;
       if (d.detailAmt != null) amt = (amt ?? 0) + d.detailAmt;
       add += d.add;
       rem += d.remove;
-      viewStoreCols.forEach((s, i) => { storeSums[i] += (d.stores?.[s] || 0); });
+      viewStoreCols.forEach((s, i) => { storeSums[i] += safeNonNegInt(d.stores?.[s]); });
+      // Remaining stock depends on every store column, not just the one in view
+      storeCols.forEach(s => { allStoresTotal += safeNonNegInt(d.stores?.[s]); });
     });
-    const storeTotal = storeSums.reduce((a, b) => a + b, 0);
-    return { pcs, amt, add, rem, storeSums, remain: pcs - storeTotal + add - rem };
-  }, [todData, viewStoreCols]);
+    return { pcs, amt, add, rem, storeSums, remain: pcs - allStoresTotal + add - rem };
+  }, [todData, viewStoreCols, storeCols]);
 
   const fmt = (n: number) => n.toLocaleString('th-TH', { maximumFractionDigits: 0 });
   const fmtMoney = (n: number) => n.toLocaleString('th-TH', { minimumFractionDigits: 0, maximumFractionDigits: 0 });

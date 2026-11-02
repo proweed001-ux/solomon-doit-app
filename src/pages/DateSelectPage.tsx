@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { normalizeDateKey, displayDateKey } from '@/lib/dateNormalizer';
-import { samePerson } from '@/lib/fieldNormalizer';
+import { psKeyOf } from '@/lib/fieldNormalizer';
 import { CalendarDays, User, Calendar } from 'lucide-react';
 
 export default function DateSelectPage() {
@@ -15,7 +15,7 @@ export default function DateSelectPage() {
     if (!selectedPS) return [];
     const map = new Map<string, number>();
     raw.forEach(r => {
-      if (!samePerson(r.psName || r.psCode || '', selectedPS)) return;
+      if (psKeyOf(r) !== selectedPS) return;
       // Use the configured date field
       const dateValue = (r[dateField as keyof typeof r] as string) || r.date || r.dateRaw || r._rawDate;
       const key = normalizeDateKey(dateValue);
